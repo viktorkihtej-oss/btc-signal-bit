@@ -27,6 +27,6 @@ while True:
         print("BTC:", price)
 
     except Exception as e:
-        print("Error:", e)
+        print("ERROR:", e)
 
     time.sleep(60)
