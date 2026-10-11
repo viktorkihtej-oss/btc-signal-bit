@@ -2,28 +2,16 @@ import os
 import time
 import logging
 import requests
-from datetime import datetime, timezone
-
-# ===== НАЛАШТУВАННЯ =====
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-
-SYMBOL = "BTC-USD"
 
 CHECK_SECONDS = 300
 RISK_REWARD = 2.0
 STOP_PERCENT = 0.012
 
-API_URL = (
-    "https://api.exchange.coinbase.com"
-    "/products/BTC-USD/candles"
-)
-
-TELEGRAM_URL = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
-    "/sendMessage"
-)
+API_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,90 +19,62 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "BTCSignalBot/1.0",
+    "User-Agent": "BTCSignalBot/2.0",
     "Accept": "application/json"
 })
 
 last_signal = None
 
 
-# ===== TELEGRAM =====
-
 def send_message(text):
     try:
-        response = session.post(
+        r = session.post(
             TELEGRAM_URL,
-            data={
-                "chat_id": CHAT_ID,
-                "text": text
-            },
+            data={"chat_id": CHAT_ID, "text": text},
             timeout=20
         )
+        r.raise_for_status()
 
-        response.raise_for_status()
-
-        result = response.json()
+        result = r.json()
 
         if not result.get("ok"):
-            logging.error(
-                "Telegram error: %s",
-                result.get("description")
-            )
+            logging.error("Telegram error: %s", result)
             return False
 
         logging.info("Telegram message sent")
         return True
 
-    except Exception as error:
-        logging.error(
-            "Telegram request failed: %s",
-            error
-        )
+    except Exception as e:
+        logging.error("Telegram failed: %s", e)
         return False
 
 
-# ===== ОТРИМАННЯ СВІЧОК =====
-
 def get_candles(granularity):
-    response = session.get(
+    r = session.get(
         API_URL,
-        params={
-            "granularity": granularity
-        },
+        params={"granularity": granularity},
         timeout=20
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not isinstance(data, list):
-        raise ValueError(
-            f"Invalid candle data: {data}"
-        )
+    r.raise_for_status()
+    data = r.json()
 
     candles = []
 
-    for candle in data:
-        if len(candle) < 6:
-            continue
+    for c in data:
+        if len(c) >= 6:
+            candles.append({
+                "time": int(c[0]),
+                "low": float(c[1]),
+                "high": float(c[2]),
+                "open": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5])
+            })
 
-        candles.append({
-            "time": int(candle[0]),
-            "low": float(candle[1]),
-            "high": float(candle[2]),
-            "open": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5])
-        })
+    candles.sort(key=lambda x: x["time"])
 
-    candles.sort(
-        key=lambda item: item["time"]
-    )
-
-    # Не використовуємо незакриту свічку
     now = int(time.time())
 
     candles = [
@@ -123,22 +83,14 @@ def get_candles(granularity):
     ]
 
     if len(candles) < 60:
-        raise ValueError(
-            "Not enough candle data"
-        )
+        raise ValueError("Not enough candle data")
 
     return candles
 
 
-# ===== EMA =====
-
 def ema(values, period):
-    if len(values) < period:
-        raise ValueError("Not enough EMA data")
-
-    multiplier = 2 / (period + 1)
-
     result = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
 
     for value in values[period:]:
         result = (
@@ -149,87 +101,112 @@ def ema(values, period):
     return result
 
 
-# ===== RSI =====
-
 def rsi(values, period=14):
-    if len(values) <= period:
-        raise ValueError("Not enough RSI data")
-
     changes = [
         values[i] - values[i - 1]
         for i in range(1, len(values))
     ]
 
-    gains = [
-        max(change, 0)
-        for change in changes
-    ]
-
-    losses = [
-        max(-change, 0)
-        for change in changes
-    ]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(changes)):
         avg_gain = (
-            avg_gain * (period - 1)
-            + gains[i]
+            avg_gain * (period - 1) + gains[i]
         ) / period
 
         avg_loss = (
-            avg_loss * (period - 1)
-            + losses[i]
+            avg_loss * (period - 1) + losses[i]
         ) / period
 
     if avg_loss == 0:
-        if avg_gain == 0:
-            return 50.0
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
 
     return 100 - (100 / (1 + rs))
 
 
-# ===== АНАЛІЗ =====
+def signal_score(
+    direction,
+    price,
+    ema20,
+    ema50,
+    ema20_1h,
+    ema50_1h,
+    current_rsi,
+    volume_ratio
+):
+    score = 50
+
+    if direction == "LONG":
+        if ema20 > ema50:
+            score += 7
+
+        if ema20_1h > ema50_1h:
+            score += 10
+
+        if price > ema20:
+            score += 5
+
+        if 55 <= current_rsi <= 65:
+            score += 8
+
+    else:
+        if ema20 < ema50:
+            score += 7
+
+        if ema20_1h < ema50_1h:
+            score += 10
+
+        if price < ema20:
+            score += 5
+
+        if 35 <= current_rsi <= 45:
+            score += 8
+
+    if volume_ratio >= 1.5:
+        score += 10
+    elif volume_ratio >= 1.2:
+        score += 6
+    elif volume_ratio < 0.8:
+        score -= 7
+
+    return max(5, min(score, 90))
+
 
 def analyze():
-    candles_15m = get_candles(900)
-    candles_1h = get_candles(3600)
+    candles15 = get_candles(900)
+    candles1h = get_candles(3600)
 
-    closes_15m = [
-        c["close"] for c in candles_15m
-    ]
+    closes15 = [c["close"] for c in candles15]
+    closes1h = [c["close"] for c in candles1h]
 
-    closes_1h = [
-        c["close"] for c in candles_1h
-    ]
+    price = closes15[-1]
 
-    price = closes_15m[-1]
+    ema20 = ema(closes15, 20)
+    ema50 = ema(closes15, 50)
 
-    ema20 = ema(closes_15m, 20)
-    ema50 = ema(closes_15m, 50)
+    ema20_1h = ema(closes1h, 20)
+    ema50_1h = ema(closes1h, 50)
 
-    ema20_1h = ema(closes_1h, 20)
-    ema50_1h = ema(closes_1h, 50)
+    current_rsi = rsi(closes15)
 
-    current_rsi = rsi(closes_15m)
+    volumes = [c["volume"] for c in candles15]
 
-    candle_time = candles_15m[-1]["time"]
-
-    logging.info(
-        "BTC %.2f | RSI %.2f | EMA20 %.2f | EMA50 %.2f",
-        price,
-        current_rsi,
-        ema20,
-        ema50
+    average_volume = (
+        sum(volumes[-21:-1]) / 20
     )
 
-    # LONG: напрямок на обох таймфреймах
-    # і підтвердження імпульсу
+    current_volume = volumes[-1]
+
+    if average_volume > 0:
+        volume_ratio = current_volume / average_volume
+    else:
+        volume_ratio = 1.0
 
     long_signal = (
         ema20 > ema50
@@ -237,9 +214,6 @@ def analyze():
         and price > ema20
         and 52 <= current_rsi <= 68
     )
-
-    # SHORT: напрямок на обох таймфреймах
-    # і підтвердження імпульсу
 
     short_signal = (
         ema20 < ema50
@@ -250,24 +224,36 @@ def analyze():
 
     if long_signal:
         direction = "LONG"
-
         stop = price * (1 - STOP_PERCENT)
-
         take = price + (
             price - stop
         ) * RISK_REWARD
 
     elif short_signal:
         direction = "SHORT"
-
         stop = price * (1 + STOP_PERCENT)
-
         take = price - (
             stop - price
         ) * RISK_REWARD
 
     else:
+        logging.info(
+            "No signal | BTC %.2f | RSI %.1f",
+            price,
+            current_rsi
+        )
         return None
+
+    score = signal_score(
+        direction,
+        price,
+        ema20,
+        ema50,
+        ema20_1h,
+        ema50_1h,
+        current_rsi,
+        volume_ratio
+    )
 
     return {
         "direction": direction,
@@ -275,50 +261,49 @@ def analyze():
         "stop": stop,
         "take": take,
         "rsi": current_rsi,
-        "candle_time": candle_time
+        "volume_ratio": volume_ratio,
+        "score": score,
+        "candle_time": candles15[-1]["time"]
     }
 
 
-# ===== ФОРМУВАННЯ СИГНАЛУ =====
+def format_signal(s):
+    icon = "🟢" if s["direction"] == "LONG" else "🔴"
 
-def format_signal(signal):
-    direction = signal["direction"]
-
-    if direction == "LONG":
-        icon = "🟢"
+    if s["score"] >= 80:
+        strength = "ДУЖЕ СИЛЬНИЙ"
+    elif s["score"] >= 70:
+        strength = "СИЛЬНИЙ"
+    elif s["score"] >= 60:
+        strength = "СЕРЕДНІЙ"
     else:
-        icon = "🔴"
+        strength = "СЛАБКИЙ"
 
     return (
         f"{icon} BTC SIGNAL\n\n"
-        f"Напрямок: {direction}\n"
-        f"Вхід орієнтовно: "
-        f"${signal['price']:,.2f}\n"
-        f"Stop Loss: "
-        f"${signal['stop']:,.2f}\n"
-        f"Take Profit: "
-        f"${signal['take']:,.2f}\n\n"
-        f"RSI: {signal['rsi']:.1f}\n"
+        f"Напрямок: {s['direction']}\n"
+        f"Вхід: ${s['price']:,.2f}\n"
+        f"Stop Loss: ${s['stop']:,.2f}\n"
+        f"Take Profit: ${s['take']:,.2f}\n\n"
+        f"📊 Оцінка сигналу: {s['score']}%\n"
+        f"Сила: {strength}\n\n"
+        f"RSI: {s['rsi']:.1f}\n"
+        f"Обсяг: {s['volume_ratio']:.2f}x середнього\n"
         f"Risk/Reward: 1:2\n\n"
-        f"Сигнал за закритими свічками.\n"
-        f"Перевір актуальну ціну перед входом.\n"
-        f"Не гарантує прибутку."
+        f"⚠️ Відсоток — оцінка сили сигналу, "
+        f"а не гарантована ймовірність прибутку."
     )
 
-
-# ===== ОСНОВНИЙ ЦИКЛ =====
 
 def main():
     global last_signal
 
-    logging.info("BTC Signal Bot starting")
+    logging.info("BTC Signal Bot v2 starting")
 
     send_message(
-        "✅ BTC Signal Bot запущений!\n\n"
-        "Моніторинг BTC активний.\n"
-        "Таймфрейми: 15m та 1h.\n"
-        "Перевірка кожні 5 хвилин.\n"
-        "Сигнали: LONG / SHORT."
+        "✅ BTC Signal Bot v2 запущений!\n\n"
+        "EMA + RSI + обсяг активні.\n"
+        "Оцінка сили сигналу активна."
     )
 
     while True:
@@ -332,20 +317,15 @@ def main():
                 )
 
                 if signal_id != last_signal:
-                    message = format_signal(signal)
-
-                    if send_message(message):
+                    if send_message(
+                        format_signal(signal)
+                    ):
                         last_signal = signal_id
 
-            else:
-                logging.info(
-                    "No confirmed signal"
-                )
-
-        except Exception as error:
+        except Exception as e:
             logging.exception(
                 "Analysis error: %s",
-                error
+                e
             )
 
         time.sleep(CHECK_SECONDS)
