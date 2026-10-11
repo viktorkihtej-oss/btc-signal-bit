@@ -1,52 +1,140 @@
-import os
-import time
-import requests
+ema20_1h = ema(closes_1h, 20)
+    ema50_1h = ema(closes_1h, 50)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+    current_rsi = rsi(closes_15m)
 
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        data={"chat_id": CHAT_ID, "text": text},
-        timeout=20
+    candle_time = candles_15m[-1]["time"]
+
+    logging.info(
+        "BTC %.2f | RSI %.2f | EMA20 %.2f | EMA50 %.2f",
+        price,
+        current_rsi,
+        ema20,
+        ema50
     )
 
-def get_candles():
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-    r = requests.get(
-        url,
-        params={"granularity": 900},
-        headers={"User-Agent": "BTC-Signal-Bot"},
-        timeout=20
+    # LONG: напрямок на обох таймфреймах
+    # і підтвердження імпульсу
+
+    long_signal = (
+        ema20 > ema50
+        and ema20_1h > ema50_1h
+        and price > ema20
+        and 52 <= current_rsi <= 68
     )
-    r.raise_for_status()
-    data = r.json()
-    data.sort(key=lambda x: x[0])
-    return data
 
-def ema(values, period):
-    k = 2 / (period + 1)
-    result = values[0]
-    for value in values[1:]:
-        result = value * k + result * (1 - k)
-    return result
+    # SHORT: напрямок на обох таймфреймах
+    # і підтвердження імпульсу
 
-def rsi(values, period=14):
-    gains = []
-    losses = []
+    short_signal = (
+        ema20 < ema50
+        and ema20_1h < ema50_1h
+        and price < ema20
+        and 32 <= current_rsi <= 48
+    )
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    if long_signal:
+        direction = "LONG"
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+        stop = price * (1 - STOP_PERCENT)
 
-    if avg_loss == 0:
-        return 100.0
+        take = price + (
+            price - stop
+        ) * RISK_REWARD
 
-    rs = avg_gain / avg_loss
-    return 100
+    elif short_signal:
+        direction = "SHORT"
+
+        stop = price * (1 + STOP_PERCENT)
+
+        take = price - (
+            stop - price
+        ) * RISK_REWARD
+
+    else:
+        return None
+
+    return {
+        "direction": direction,
+        "price": price,
+        "stop": stop,
+        "take": take,
+        "rsi": current_rsi,
+        "candle_time": candle_time
+    }
+
+
+# ===== ФОРМУВАННЯ СИГНАЛУ =====
+
+def format_signal(signal):
+    direction = signal["direction"]
+
+    if direction == "LONG":
+        icon = "🟢"
+    else:
+        icon = "🔴"
+
+    return (
+        f"{icon} BTC SIGNAL\n\n"
+        f"Напрямок: {direction}\n"
+        f"Вхід орієнтовно: "
+        f"${signal['price']:,.2f}\n"
+        f"Stop Loss: "
+        f"${signal['stop']:,.2f}\n"
+        f"Take Profit: "
+        f"${signal['take']:,.2f}\n\n"
+        f"RSI: {signal['rsi']:.1f}\n"
+        f"Risk/Reward: 1:2\n\n"
+        f"Сигнал за закритими свічками.\n"
+        f"Перевір актуальну ціну перед входом.\n"
+        f"Не гарантує прибутку."
+    )
+
+
+# ===== ОСНОВНИЙ ЦИКЛ =====
+
+def main():
+    global last_signal
+
+    logging.info("BTC Signal Bot starting")
+
+    send_message(
+        "✅ BTC Signal Bot запущений!\n\n"
+        "Моніторинг BTC активний.\n"
+        "Таймфрейми: 15m та 1h.\n"
+        "Перевірка кожні 5 хвилин.\n"
+        "Сигнали: LONG / SHORT."
+    )
+
+    while True:
+        try:
+            signal = analyze()
+
+            if signal:
+                signal_id = (
+                    signal["direction"],
+                    signal["candle_time"]
+                )
+
+                if signal_id != last_signal:
+                    message = format_signal(signal)
+
+                    if send_message(message):
+                        last_signal = signal_id
+
+            else:
+                logging.info(
+                    "No confirmed signal"
+                )
+
+        except Exception as error:
+            logging.exception(
+                "Analysis error: %s",
+                error
+            )
+
+        time.sleep(CHECK_SECONDS)
+
+
+if name == "main":
+    main()
