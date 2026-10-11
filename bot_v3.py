@@ -987,11 +987,11 @@ def main():
 
     if STATE.exists():
 
-        try:
+            try:
             saved = json.loads(
                 STATE.read_text()
             )
-                        last_signal = saved.get(
+            last_signal = saved.get(
                 "id"
             )
 
