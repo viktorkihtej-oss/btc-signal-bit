@@ -1,4 +1,219 @@
-ema20_1h = ema(closes_1h, 20)
+import os
+import time
+import logging
+import requests
+from datetime import datetime, timezone
+
+# ===== НАЛАШТУВАННЯ =====
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+
+SYMBOL = "BTC-USD"
+
+CHECK_SECONDS = 300
+RISK_REWARD = 2.0
+STOP_PERCENT = 0.012
+
+API_URL = (
+    "https://api.exchange.coinbase.com"
+    "/products/BTC-USD/candles"
+)
+
+TELEGRAM_URL = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}"
+    "/sendMessage"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "BTCSignalBot/1.0",
+    "Accept": "application/json"
+})
+
+last_signal = None
+
+
+# ===== TELEGRAM =====
+
+def send_message(text):
+    try:
+        response = session.post(
+            TELEGRAM_URL,
+            data={
+                "chat_id": CHAT_ID,
+                "text": text
+            },
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            logging.error(
+                "Telegram error: %s",
+                result.get("description")
+            )
+            return False
+
+        logging.info("Telegram message sent")
+        return True
+
+    except Exception as error:
+        logging.error(
+            "Telegram request failed: %s",
+            error
+        )
+        return False
+
+
+# ===== ОТРИМАННЯ СВІЧОК =====
+
+def get_candles(granularity):
+    response = session.get(
+        API_URL,
+        params={
+            "granularity": granularity
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        raise ValueError(
+            f"Invalid candle data: {data}"
+        )
+
+    candles = []
+
+    for candle in data:
+        if len(candle) < 6:
+            continue
+
+        candles.append({
+            "time": int(candle[0]),
+            "low": float(candle[1]),
+            "high": float(candle[2]),
+            "open": float(candle[3]),
+            "close": float(candle[4]),
+            "volume": float(candle[5])
+        })
+
+    candles.sort(
+        key=lambda item: item["time"]
+    )
+
+    # Не використовуємо незакриту свічку
+    now = int(time.time())
+
+    candles = [
+        c for c in candles
+        if c["time"] + granularity <= now
+    ]
+
+    if len(candles) < 60:
+        raise ValueError(
+            "Not enough candle data"
+        )
+
+    return candles
+
+
+# ===== EMA =====
+
+def ema(values, period):
+    if len(values) < period:
+        raise ValueError("Not enough EMA data")
+
+    multiplier = 2 / (period + 1)
+
+    result = sum(values[:period]) / period
+
+    for value in values[period:]:
+        result = (
+            value * multiplier
+            + result * (1 - multiplier)
+        )
+
+    return result
+
+
+# ===== RSI =====
+
+def rsi(values, period=14):
+    if len(values) <= period:
+        raise ValueError("Not enough RSI data")
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
+    gains = [
+        max(change, 0)
+        for change in changes
+    ]
+
+    losses = [
+        max(-change, 0)
+        for change in changes
+    ]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1)
+            + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1)
+            + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        if avg_gain == 0:
+            return 50.0
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + rs))
+
+
+# ===== АНАЛІЗ =====
+
+def analyze():
+    candles_15m = get_candles(900)
+    candles_1h = get_candles(3600)
+
+    closes_15m = [
+        c["close"] for c in candles_15m
+    ]
+
+    closes_1h = [
+        c["close"] for c in candles_1h
+    ]
+
+    price = closes_15m[-1]
+
+    ema20 = ema(closes_15m, 20)
+    ema50 = ema(closes_15m, 50)
+
+    ema20_1h = ema(closes_1h, 20)
     ema50_1h = ema(closes_1h, 50)
 
     current_rsi = rsi(closes_15m)
@@ -136,5 +351,5 @@ def main():
         time.sleep(CHECK_SECONDS)
 
 
-if name == "main":
+if __name__ == "__main__":
     main()
