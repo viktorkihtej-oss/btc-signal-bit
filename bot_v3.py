@@ -2,37 +2,18 @@ import os
 import time
 import logging
 import requests
-import statistics
-from datetime import datetime, timezone
-
-# =========================
-# НАЛАШТУВАННЯ
-# =========================
+import math
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
+BASE = "https://api.bitget.com"
 SYMBOL = "BTCUSDT"
+PRODUCT = "USDT-FUTURES"
+
 CHECK_SECONDS = 60
-
-# Тільки сильні сигнали
-MIN_SIGNAL_SCORE = 80
-
-# Мінімальне співвідношення прибуток/ризик
-RISK_REWARD = 2.0
-
-TELEGRAM_URL = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-)
-
-# Coinbase залишаємо резервним джерелом свічок
-COINBASE_URL = (
-    "https://api.exchange.coinbase.com/"
-    "products/BTC-USD/candles"
-)
-
-# Bybit — ф'ючерсні дані
-BYBIT_URL = "https://api.bybit.com"
+MIN_SCORE = 85
+RR = 2.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,642 +21,399 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "BTCSignalBot/3.0",
+    "User-Agent": "BTCSignalBot/3.1",
     "Accept": "application/json"
 })
 
 last_signal = None
 
 
-# =========================
-# TELEGRAM
-# =========================
-
-def send_message(text):
+def telegram(text):
     try:
         r = session.post(
-            TELEGRAM_URL,
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
                 "text": text
             },
-            timeout=20
+            timeout=15
         )
-
         r.raise_for_status()
-
         result = r.json()
 
         if not result.get("ok"):
-            logging.error(
-                "Telegram error: %s",
-                result
-            )
-            return False
+            raise ValueError(result)
 
-        logging.info("Telegram message sent")
         return True
 
     except Exception as e:
-        logging.error(
-            "Telegram failed: %s",
-            e
-        )
+        logging.error("Telegram error: %s", e)
         return False
 
 
-# =========================
-# COINBASE CANDLES
-# =========================
+def api(path, extra=None):
+    params = {
+        "symbol": SYMBOL,
+        "productType": PRODUCT
+    }
 
-def get_candles(granularity):
+    if extra:
+        params.update(extra)
+
     r = session.get(
-        COINBASE_URL,
-        params={
-            "granularity": granularity
-        },
-        timeout=20
-    )
-
-    r.raise_for_status()
-    data = r.json()
-
-    if not isinstance(data, list):
-        raise ValueError(
-            f"Invalid Coinbase data: {data}"
-        )
-
-    candles = []
-
-    for c in data:
-        if len(c) >= 6:
-            candles.append({
-                "time": int(c[0]),
-                "low": float(c[1]),
-                "high": float(c[2]),
-                "open": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5])
-            })
-
-    candles.sort(
-        key=lambda x: x["time"]
-    )
-
-    now = int(time.time())
-
-    # Використовуємо тільки закриті свічки
-    candles = [
-        c for c in candles
-        if c["time"] + granularity <= now
-    ]
-
-    if len(candles) < 210:
-        raise ValueError(
-            "Not enough candle data"
-        )
-
-    return candles
-
-
-# =========================
-# ІНДИКАТОРИ
-# =========================
-
-def ema(values, period):
-    if len(values) < period:
-        raise ValueError("Not enough EMA data")
-
-    result = (
-        sum(values[:period]) / period
-    )
-
-    multiplier = 2 / (period + 1)
-
-    for value in values[period:]:
-        result = (
-            value * multiplier
-            + result * (1 - multiplier)
-        )
-
-    return result
-
-
-def rsi(values, period=14):
-    if len(values) <= period:
-        raise ValueError("Not enough RSI data")
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-
-    gains = [
-        max(change, 0)
-        for change in changes
-    ]
-
-    losses = [
-        max(-change, 0)
-        for change in changes
-    ]
-
-    avg_gain = (
-        sum(gains[:period]) / period
-    )
-
-    avg_loss = (
-        sum(losses[:period]) / period
-    )
-
-    for i in range(
-        period,
-        len(changes)
-    ):
-        avg_gain = (
-            avg_gain * (period - 1)
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1)
-            + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        if avg_gain == 0:
-            return 50.0
-        return 100.0
-
-    rs = avg_gain / avg_loss
-
-    return (
-        100 - (100 / (1 + rs))
-    )
-
-
-def atr(candles, period=14):
-    if len(candles) <= period:
-        raise ValueError("Not enough ATR data")
-
-    ranges = []
-
-    for i in range(
-        len(candles) - period,
-        len(candles)
-    ):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        true_range = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            )
-        )
-
-        ranges.append(true_range)
-
-    return sum(ranges) / len(ranges)
-
-
-# =========================
-# BYBIT FUTURES
-# =========================
-
-def bybit_get(path, params):
-    r = session.get(
-        BYBIT_URL + path,
+        BASE + path,
         params=params,
         timeout=15
     )
 
     r.raise_for_status()
+    result = r.json()
 
-    data = r.json()
+    if result.get("code") != "00000":
+        raise ValueError(result)
 
-    if data.get("retCode") != 0:
+    if result.get("data") is None:
+        raise ValueError("Empty API data")
+
+    return result["data"]
+
+
+def candles(tf, seconds):
+    data = api(
+        "/api/v2/mix/market/candles",
+        {
+            "granularity": tf,
+            "limit": "250"
+        }
+    )
+
+    result = []
+
+    now = int(time.time())
+
+    for x in data:
+        stamp = int(x[0]) // 1000
+
+        if stamp + seconds > now:
+            continue
+
+        result.append({
+            "time": stamp,
+            "open": float(x[1]),
+            "high": float(x[2]),
+            "low": float(x[3]),
+            "close": float(x[4]),
+            "volume": float(x[5])
+        })
+
+    result.sort(key=lambda x: x["time"])
+
+    if len(result) < 205:
         raise ValueError(
-            f"Bybit error: {data}"
+            f"Not enough {tf} candles"
         )
 
-    return data
-
-
-def get_futures_data():
-    result = {
-        "funding": None,
-        "open_interest": None,
-        "bid_volume": None,
-        "ask_volume": None,
-        "orderbook_ratio": None
-    }
-
-    # Funding + OI
-    try:
-        data = bybit_get(
-            "/v5/market/tickers",
-            {
-                "category": "linear",
-                "symbol": SYMBOL
-            }
-        )
-
-        ticker = (
-            data["result"]["list"][0]
-        )
-
-        result["funding"] = float(
-            ticker.get(
-                "fundingRate",
-                0
-            )
-        )
-
-        result["open_interest"] = float(
-            ticker.get(
-                "openInterest",
-                0
-            )
-        )
-
-    except Exception as e:
-        logging.warning(
-            "Bybit ticker unavailable: %s",
-            e
-        )
-
-    # Стакан
-    try:
-        data = bybit_get(
-            "/v5/market/orderbook",
-            {
-                "category": "linear",
-                "symbol": SYMBOL,
-                "limit": 50
-            }
-        )
-
-        bids = data["result"]["b"]
-        asks = data["result"]["a"]
-
-        bid_volume = sum(
-            float(x[1])
-            for x in bids
-        )
-
-        ask_volume = sum(
-            float(x[1])
-            for x in asks
-        )
-
-        result["bid_volume"] = bid_volume
-        result["ask_volume"] = ask_volume
-
-        if ask_volume > 0:
-            result[
-                "orderbook_ratio"
-            ] = (
-                bid_volume
-                / ask_volume
-            )
-
-    except Exception as e:
-        logging.warning(
-            "Bybit orderbook unavailable: %s",
-            e
+    if now - result[-1]["time"] > seconds * 3:
+        raise ValueError(
+            f"Stale {tf} candles"
         )
 
     return result
 
 
-# =========================
-# АНАЛІЗ РИНКУ
-# =========================
+def ema(values, period):
+    result = sum(values[:period]) / period
+    k = 2 / (period + 1)
+
+    for value in values[period:]:
+        result = value * k + result * (1 - k)
+
+    return result
+
+
+def rsi(values, period=14):
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
+
+    gain = sum(gains[:period]) / period
+    loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+        gain = (
+            gain * (period - 1) + gains[i]
+        ) / period
+
+        loss = (
+            loss * (period - 1) + losses[i]
+        ) / period
+
+    if loss == 0:
+        return 100.0 if gain > 0 else 50.0
+
+    rs = gain / loss
+
+    return 100 - 100 / (1 + rs)
+
+
+def atr(data, period=14):
+    ranges = []
+
+    for i in range(
+        len(data) - period,
+        len(data)
+    ):
+        c = data[i]
+        p = data[i - 1]
+
+        ranges.append(max(
+            c["high"] - c["low"],
+            abs(c["high"] - p["close"]),
+            abs(c["low"] - p["close"])
+        ))
+
+    return sum(ranges) / len(ranges)
+
+
+def trend(data):
+    closes = [x["close"] for x in data]
+
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    e200 = ema(closes, 200)
+
+    if e20 > e50 > e200:
+        return "LONG"
+
+    if e20 < e50 < e200:
+        return "SHORT"
+
+    return "WAIT"
+
+
+def market_data():
+    ticker = api(
+        "/api/v2/mix/market/ticker"
+    )[0]
+
+    price = float(ticker["lastPr"])
+    ticker_time = int(ticker["ts"]) / 1000
+
+    if time.time() - ticker_time > 90:
+        raise ValueError("Stale ticker")
+
+    depth = api(
+        "/api/v2/mix/market/merge-depth",
+        {"limit": "50"}
+    )
+
+    if time.time() - int(depth["ts"]) / 1000 > 90:
+        raise ValueError("Stale orderbook")
+
+    bids = depth["bids"]
+    asks = depth["asks"]
+
+    if not bids or not asks:
+        raise ValueError("Empty orderbook")
+
+    bid_volume = sum(float(x[1]) for x in bids)
+    ask_volume = sum(float(x[1]) for x in asks)
+
+    if bid_volume <= 0 or ask_volume <= 0:
+        raise ValueError("Invalid orderbook")
+
+    book_ratio = bid_volume / ask_volume
+
+    funding_data = api(
+        "/api/v2/mix/market/current-fund-rate"
+    )
+
+    funding = float(
+        funding_data[0]["fundingRate"]
+    )
+
+    oi_data = api(
+        "/api/v2/mix/market/open-interest"
+    )
+
+    oi = float(
+        oi_data["openInterestList"][0]["size"]
+    )
+
+    trades = api(
+        "/api/v2/mix/market/fills",
+        {"limit": "100"}
+    )
+
+    if not trades:
+        raise ValueError("No recent trades")
+
+    recent = [
+        t for t in trades
+        if time.time() - int(t["ts"]) / 1000 < 120
+    ]
+
+    if len(recent) < 10:
+        raise ValueError("Not enough recent trades")
+
+    buy = sum(
+        float(t["size"]) * float(t["price"])
+        for t in recent
+        if t["side"].lower() == "buy"
+    )
+
+    sell = sum(
+        float(t["size"]) * float(t["price"])
+        for t in recent
+        if t["side"].lower() == "sell"
+    )
+
+    if buy + sell <= 0:
+        raise ValueError("Invalid trade volume")
+
+    buy_share = buy / (buy + sell)
+
+    return {
+        "price": price,
+        "book": book_ratio,
+        "funding": funding,
+        "oi": oi,
+        "buy_share": buy_share
+    }
+
 
 def analyze():
-    # 15 хвилин
-    candles15 = get_candles(900)
+    c15 = candles("15m", 900)
+    c1h = candles("1H", 3600)
+    c4h = candles("4H", 14400)
 
-    # 1 година
-    candles1h = get_candles(3600)
+    t15 = trend(c15)
+    t1h = trend(c1h)
+    t4h = trend(c4h)
 
-    closes15 = [
-        c["close"]
-        for c in candles15
-    ]
-
-    closes1h = [
-        c["close"]
-        for c in candles1h
-    ]
-
-    price = closes15[-1]
-
-    ema20 = ema(
-        closes15,
-        20
-    )
-
-    ema50 = ema(
-        closes15,
-        50
-    )
-
-    ema200 = ema(
-        closes15,
-        200
-    )
-
-    ema20_1h = ema(
-        closes1h,
-        20
-    )
-
-    ema50_1h = ema(
-        closes1h,
-        50
-    )
-
-    ema200_1h = ema(
-        closes1h,
-        200
-    )
-
-    current_rsi = rsi(
-        closes15
-    )
-
-    current_atr = atr(
-        candles15
-    )
-
-    # Обсяг
-    volumes = [
-        c["volume"]
-        for c in candles15
-    ]
-
-    average_volume = (
-        sum(volumes[-21:-1]) / 20
-    )
-
-    if average_volume > 0:
-        volume_ratio = (
-            volumes[-1]
-            / average_volume
-        )
-    else:
-        volume_ratio = 1.0
-
-    # Рух останньої свічки
-    last_candle = candles15[-1]
-
-    candle_move = (
-        abs(
-            last_candle["close"]
-            - last_candle["open"]
-        )
-    )
-
-    # Не переслідуємо занадто
-    # різкий рух
-    overextended = (
-        current_atr > 0
-        and candle_move
-        > current_atr * 1.8
-    )
-
-    futures = get_futures_data()
-
-    book_ratio = futures[
-        "orderbook_ratio"
-    ]
-
-    funding = futures[
-        "funding"
-    ]
-
-    # =====================
-    # LONG SCORE
-    # =====================
-
-    long_score = 0
-    long_reasons = []
-
-    if ema20 > ema50:
-        long_score += 10
-        long_reasons.append(
-            "EMA20 > EMA50"
-        )
-
-    if ema50 > ema200:
-        long_score += 15
-        long_reasons.append(
-            "15m тренд вгору"
-        )
-
-    if ema20_1h > ema50_1h:
-        long_score += 15
-        long_reasons.append(
-            "1h імпульс вгору"
-        )
-
-    if ema50_1h > ema200_1h:
-        long_score += 20
-        long_reasons.append(
-            "1h тренд вгору"
-        )
-
-    if price > ema20:
-        long_score += 5
-
-    if 52 <= current_rsi <= 64:
-        long_score += 10
-        long_reasons.append(
-            "RSI підтримує LONG"
-        )
-
-    if volume_ratio >= 1.2:
-        long_score += 10
-        long_reasons.append(
-            "обсяг підтверджує"
-        )
-
-    if (
-        book_ratio is not None
-        and book_ratio >= 1.15
+    if not (
+        t15 == t1h == t4h
+        and t15 != "WAIT"
     ):
-        long_score += 10
-        long_reasons.append(
-            "стакан за покупців"
-        )
-
-    if (
-        funding is not None
-        and funding < 0.0005
-    ):
-        long_score += 5
-
-    if volume_ratio < 0.8:
-        long_score -= 10
-
-    if overextended:
-        long_score -= 20
-
-    # =====================
-    # SHORT SCORE
-    # =====================
-
-    short_score = 0
-    short_reasons = []
-
-    if ema20 < ema50:
-        short_score += 10
-        short_reasons.append(
-            "EMA20 < EMA50"
-        )
-
-    if ema50 < ema200:
-        short_score += 15
-        short_reasons.append(
-            "15m тренд вниз"
-        )
-
-    if ema20_1h < ema50_1h:
-        short_score += 15
-        short_reasons.append(
-            "1h імпульс вниз"
-        )
-
-    if ema50_1h < ema200_1h:
-        short_score += 20
-        short_reasons.append(
-            "1h тренд вниз"
-        )
-
-    if price < ema20:
-        short_score += 5
-
-    if 36 <= current_rsi <= 48:
-        short_score += 10
-        short_reasons.append(
-            "RSI підтримує SHORT"
-        )
-
-    if volume_ratio >= 1.2:
-        short_score += 10
-        short_reasons.append(
-            "обсяг підтверджує"
-        )
-
-    if (
-        book_ratio is not None
-        and book_ratio <= 0.87
-    ):
-        short_score += 10
-        short_reasons.append(
-            "стакан за продавців"
-        )
-
-    if (
-        funding is not None
-        and funding > -0.0005
-    ):
-        short_score += 5
-
-    if volume_ratio < 0.8:
-        short_score -= 10
-
-    if overextended:
-        short_score -= 20
-
-    long_score = max(
-        0,
-        min(long_score, 100)
-    )
-
-    short_score = max(
-        0,
-        min(short_score, 100)
-    )
-
-    logging.info(
-        (
-            "BTC %.2f | RSI %.1f | "
-            "VOL %.2fx | LONG %s | "
-            "SHORT %s | BOOK %s"
-        ),
-        price,
-        current_rsi,
-        volume_ratio,
-        long_score,
-        short_score,
-        book_ratio
-    )
-
-    # Сигнал тільки якщо
-    # перевага очевидна
-    if (
-        long_score >= MIN_SIGNAL_SCORE
-        and long_score
-        >= short_score + 20
-        and not overextended
-    ):
-        direction = "LONG"
-        score = long_score
-        reasons = long_reasons
-
-    elif (
-        short_score >= MIN_SIGNAL_SCORE
-        and short_score
-        >= long_score + 20
-        and not overextended
-    ):
-        direction = "SHORT"
-        score = short_score
-        reasons = short_reasons
-
-    else:
+        logging.info("WAIT: trends disagree")
         return None
 
-    # ATR-стоп
-    stop_distance = max(
+    direction = t15
+
+    m = market_data()
+    price = m["price"]
+
+    closes = [x["close"] for x in c15]
+    current_rsi = rsi(closes)
+    current_atr = atr(c15)
+
+    if current_atr <= 0:
+        return None
+
+    volumes = [x["volume"] for x in c15]
+    avg_volume = sum(volumes[-21:-1]) / 20
+
+    if avg_volume <= 0:
+        return None
+
+    volume_ratio = volumes[-1] / avg_volume
+
+    # Сильний сигнал потребує обсягу
+    if volume_ratio < 1.2:
+        logging.info("WAIT: weak volume")
+        return None
+
+    # Не переслідуємо різку свічку
+    last = c15[-1]
+
+    move = abs(
+        last["close"] - last["open"]
+    )
+
+    if move > current_atr * 1.5:
+        logging.info("WAIT: extended candle")
+        return None
+
+    # Перевірка відстані від EMA20
+    e20 = ema(closes, 20)
+
+    if abs(price - e20) > current_atr * 2:
+        logging.info("WAIT: price too far from EMA")
+        return None
+
+    score = 50
+    reasons = ["Тренди 15m, 1h, 4h збігаються"]
+
+    if volume_ratio >= 1.5:
+        score += 15
+        reasons.append("Підвищений обсяг")
+    else:
+        score += 10
+        reasons.append("Обсяг підтверджує рух")
+
+    if direction == "LONG":
+        if not 52 <= current_rsi <= 65:
+            return None
+
+        if m["book"] < 1.15:
+            return None
+
+        if m["buy_share"] < 0.55:
+            return None
+
+        if price <= e20:
+            return None
+
+        score += 25
+
+        reasons.append("Стакан підтримує LONG")
+        reasons.append("Переважають агресивні покупки")
+
+    else:
+        if not 35 <= current_rsi <= 48:
+            return None
+
+        if m["book"] > 0.87:
+            return None
+
+        if m["buy_share"] > 0.45:
+            return None
+
+        if price >= e20:
+            return None
+
+        score += 25
+
+        reasons.append("Стакан підтримує SHORT")
+        reasons.append("Переважають агресивні продажі")
+
+    if abs(m["funding"]) > 0.001:
+        logging.info("WAIT: extreme funding")
+        return None
+
+    score += 10
+
+    score = min(score, 100)
+
+    if score < MIN_SCORE:
+        return None
+
+    distance = max(
         current_atr * 1.5,
         price * 0.006
     )
 
     if direction == "LONG":
-        stop = (
-            price - stop_distance
-        )
-
-        take = (
-            price
-            + stop_distance
-            * RISK_REWARD
-        )
-
+        stop = price - distance
+        take = price + distance * RR
     else:
-        stop = (
-            price + stop_distance
-        )
-
-        take = (
-            price
-            - stop_distance
-            * RISK_REWARD
-        )
+        stop = price + distance
+        take = price - distance * RR
 
     return {
         "direction": direction,
@@ -684,93 +422,58 @@ def analyze():
         "take": take,
         "score": score,
         "rsi": current_rsi,
-        "atr": current_atr,
-        "volume_ratio": volume_ratio,
-        "book_ratio": book_ratio,
-        "funding": funding,
-        "open_interest":
-            futures["open_interest"],
+        "volume": volume_ratio,
+        "book": m["book"],
+        "buy_share": m["buy_share"],
+        "funding": m["funding"],
+        "oi": m["oi"],
         "reasons": reasons,
-        "candle_time":
-            candles15[-1]["time"]
+        "time": c15[-1]["time"]
     }
 
 
-# =========================
-# ПОВІДОМЛЕННЯ
-# =========================
-
 def format_signal(s):
-    if s["direction"] == "LONG":
-        icon = "🟢"
-    else:
-        icon = "🔴"
-
-    book = s["book_ratio"]
-
-    if book is None:
-        book_text = "н/д"
-    else:
-        book_text = f"{book:.2f}"
-
-    funding = s["funding"]
-
-    if funding is None:
-        funding_text = "н/д"
-    else:
-        funding_text = (
-            f"{funding * 100:.4f}%"
-        )
+    icon = (
+        "🟢" if s["direction"] == "LONG"
+        else "🔴"
+    )
 
     reasons = "\n".join(
-        f"✓ {x}"
-        for x in s["reasons"]
+        "✓ " + x for x in s["reasons"]
     )
 
     return (
-        f"{icon} BTC V3 СИЛЬНИЙ СИГНАЛ\n\n"
+        f"{icon} BTC V3.1 SIGNAL\n\n"
         f"Напрямок: {s['direction']}\n"
-        f"Вхід орієнтовно: "
-        f"${s['price']:,.2f}\n"
-        f"Stop Loss: "
-        f"${s['stop']:,.2f}\n"
-        f"Take Profit: "
-        f"${s['take']:,.2f}\n\n"
-        f"Сила сигналу: "
-        f"{s['score']}/100\n"
+        f"Вхід орієнтовно: ${s['price']:,.2f}\n"
+        f"Stop Loss: ${s['stop']:,.2f}\n"
+        f"Take Profit: ${s['take']:,.2f}\n\n"
+        f"Сила: {s['score']}/100\n"
         f"RSI: {s['rsi']:.1f}\n"
-        f"Обсяг: "
-        f"{s['volume_ratio']:.2f}x\n"
-        f"Стакан bid/ask: "
-        f"{book_text}\n"
-        f"Funding: "
-        f"{funding_text}\n"
-        f"Risk/Reward: 1:"
-        f"{RISK_REWARD:.1f}\n\n"
-        f"Підтвердження:\n"
-        f"{reasons}\n\n"
-        f"⚠️ Це сигнал алгоритму, "
-        f"а не гарантія прибутку."
+        f"Обсяг: {s['volume']:.2f}x\n"
+        f"Стакан: {s['book']:.2f}\n"
+        f"Агресивні покупки: "
+        f"{s['buy_share'] * 100:.1f}%\n"
+        f"Open Interest: {s['oi']:,.2f}\n"
+        f"Funding: {s['funding'] * 100:.4f}%\n"
+        f"Risk/Reward: 1:2\n\n"
+        f"Підтвердження:\n{reasons}\n\n"
+        f"⚠️ Тестовий сигнал.\n"
+        f"Бал сили не є ймовірністю прибутку.\n"
+        f"Перевір ціну на Binance."
     )
 
-
-# =========================
-# MAIN
-# =========================
 
 def main():
     global last_signal
 
-    logging.info(
-        "BTC Signal Bot V3 starting"
-    )
+    logging.info("BTC Bot V3.1 starting")
 
-    send_message(
-        "✅ BTC Signal Bot V3 запущений!\n\n"
+    telegram(
+        "✅ BTC Bot V3.1 запущений!\n"
+        "Джерело: Bitget Futures.\n"
         "Режим: тільки сильні сигнали.\n"
-        "EMA20/50/200 + RSI + ATR + "
-        "обсяг + стакан + funding.\n"
-        "Слабкі сигнали відсіюються."
+        "Тестування без автоматичних угод."
     )
 
     while True:
@@ -780,23 +483,19 @@ def main():
             if signal:
                 signal_id = (
                     signal["direction"],
-                    signal["candle_time"]
+                    signal["time"]
                 )
 
                 if signal_id != last_signal:
-                    if send_message(
-                        format_signal(signal)
-                    ):
+                    if telegram(format_signal(signal)):
                         last_signal = signal_id
-
+                        logging.info("Signal sent")
             else:
-                logging.info(
-                    "WAIT - no strong signal"
-                )
+                logging.info("WAIT - no strong signal")
 
         except Exception as e:
             logging.exception(
-                "Analysis error: %s",
+                "Market analysis error: %s",
                 e
             )
 
