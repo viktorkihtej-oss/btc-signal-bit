@@ -435,4 +435,616 @@ def futures_data():
             - depth_time
         )
         > 90
-   
+    ):
+        raise ValueError(
+            "Stale orderbook"
+        )
+
+    bids = depth["bids"][:30]
+    asks = depth["asks"][:30]
+
+    if (
+        not bids
+        or not asks
+    ):
+        raise ValueError(
+            "Empty orderbook"
+        )
+
+    bid_volume = sum(
+        number(x[1])
+        for x in bids
+    )
+
+    ask_volume = sum(
+        number(x[1])
+        for x in asks
+    )
+
+    if (
+        bid_volume <= 0
+        or ask_volume <= 0
+    ):
+        raise ValueError(
+            "Invalid orderbook"
+        )
+
+    book_ratio = (
+        bid_volume
+        / ask_volume
+    )
+
+    # ---------- FUNDING ----------
+
+    funding_data = fetch(
+        "/api/v2/mix/market/current-fund-rate"
+    )
+
+    if (
+        not isinstance(
+            funding_data,
+            list
+        )
+        or not funding_data
+    ):
+        raise ValueError(
+            "Funding missing"
+        )
+
+    funding = number(
+        funding_data[0][
+            "fundingRate"
+        ]
+    )
+
+    # ---------- OPEN INTEREST ----------
+
+    oi_data = fetch(
+        "/api/v2/mix/market/open-interest"
+    )
+
+    oi_list = (
+        oi_data.get(
+            "openInterestList",
+            []
+        )
+    )
+
+    if not oi_list:
+        raise ValueError(
+            "Open Interest missing"
+        )
+
+    open_interest = number(
+        oi_list[0]["size"]
+    )
+
+    if (
+        price <= 0
+        or open_interest <= 0
+    ):
+        raise ValueError(
+            "Invalid price or OI"
+        )
+
+    return {
+        "price": price,
+        "book": book_ratio,
+        "funding": funding,
+        "oi": open_interest
+    }
+
+
+# ==========================================
+# MAIN MARKET ANALYSIS
+# ==========================================
+
+def analyze():
+
+    data = {
+        "5m": candles(
+            "5m",
+            300
+        ),
+        "15m": candles(
+            "15m",
+            900
+        ),
+        "1H": candles(
+            "1H",
+            3600
+        ),
+        "4H": candles(
+            "4H",
+            14400
+        )
+    }
+
+    trends = {}
+
+    for timeframe, values in data.items():
+        trends[timeframe] = (
+            direction(values)[0]
+        )
+
+    # 15m, 1H і 4H повинні
+    # показувати один напрямок
+
+    if (
+        trends["15m"] == "WAIT"
+        or trends["1H"] != trends["15m"]
+        or trends["4H"] != trends["15m"]
+    ):
+        logging.info(
+            "WAIT trend %s",
+            trends
+        )
+        return None
+
+    side = trends["15m"]
+
+    candles15 = data["15m"]
+
+    closes = [
+        x["c"]
+        for x in candles15
+    ]
+
+    ema20 = ema(
+        closes,
+        20
+    )
+
+    current_rsi = rsi(
+        closes
+    )
+
+    current_atr = atr(
+        candles15
+    )
+
+    if current_atr <= 0:
+        return None
+
+    # ---------- VOLUME ----------
+
+    previous_volumes = [
+        x["v"]
+        for x in candles15[-21:-1]
+    ]
+
+    average_volume = statistics.mean(
+        previous_volumes
+    )
+
+    if average_volume <= 0:
+        return None
+
+    volume_ratio = (
+        candles15[-1]["v"]
+        / average_volume
+    )
+
+    # ---------- FUTURES DATA ----------
+
+    market = futures_data()
+
+    price = market["price"]
+
+    # Захист від великої різниці
+    # між останньою свічкою і поточною ціною
+
+    if (
+        abs(
+            price
+            - closes[-1]
+        )
+        / price
+        > 0.012
+    ):
+        logging.info(
+            "WAIT price moved too far"
+        )
+        return None
+
+    # ---------- VOLUME FILTER ----------
+
+    if volume_ratio < 1.20:
+        logging.info(
+            "WAIT weak volume %.2f",
+            volume_ratio
+        )
+        return None
+
+    # ---------- EMA DISTANCE ----------
+
+    distance_from_ema = abs(
+        price - ema20
+    )
+
+    if (
+        distance_from_ema
+        > current_atr * 1.5
+    ):
+        logging.info(
+            "WAIT price too far from EMA20"
+        )
+        return None
+
+    # ---------- LARGE CANDLE FILTER ----------
+
+    last_candle = candles15[-1]
+
+    candle_body = abs(
+        last_candle["c"]
+        - last_candle["o"]
+    )
+
+    if (
+        candle_body
+        > current_atr * 1.5
+    ):
+        logging.info(
+            "WAIT extended candle"
+        )
+        return None
+
+    # ---------- FUNDING FILTER ----------
+
+    if (
+        abs(
+            market["funding"]
+        )
+        > 0.001
+    ):
+        logging.info(
+            "WAIT extreme funding"
+        )
+        return None
+
+    # ---------- LONG ----------
+
+    if side == "LONG":
+
+        if not (
+            52
+            <= current_rsi
+            <= 65
+        ):
+            logging.info(
+                "WAIT LONG RSI %.1f",
+                current_rsi
+            )
+            return None
+
+        if price <= ema20:
+            logging.info(
+                "WAIT LONG below EMA20"
+            )
+            return None
+
+        if market["book"] < 1.15:
+            logging.info(
+                "WAIT LONG weak orderbook %.2f",
+                market["book"]
+            )
+            return None
+
+    # ---------- SHORT ----------
+
+    else:
+
+        if not (
+            35
+            <= current_rsi
+            <= 48
+        ):
+            logging.info(
+                "WAIT SHORT RSI %.1f",
+                current_rsi
+            )
+            return None
+
+        if price >= ema20:
+            logging.info(
+                "WAIT SHORT above EMA20"
+            )
+            return None
+
+        if market["book"] > 0.87:
+            logging.info(
+                "WAIT SHORT weak orderbook %.2f",
+                market["book"]
+            )
+            return None
+
+    # ---------- SUPPORT / RESISTANCE ----------
+
+    recent = candles15[-49:-1]
+
+    resistance = max(
+        x["h"]
+        for x in recent
+    )
+
+    support = min(
+        x["l"]
+        for x in recent
+    )
+
+    # ---------- STOP DISTANCE ----------
+
+    stop_distance = max(
+        current_atr * 1.5,
+        price * 0.006
+    )
+
+    # ---------- TARGET ----------
+
+    if side == "LONG":
+
+        target = (
+            price
+            + stop_distance * 2
+        )
+
+        if (
+            resistance > price
+            and resistance < target
+        ):
+            logging.info(
+                "WAIT resistance before 2R target"
+            )
+            return None
+
+    else:
+
+        target = (
+            price
+            - stop_distance * 2
+        )
+
+        if (
+            support < price
+            and support > target
+        ):
+            logging.info(
+                "WAIT support before 2R target"
+            )
+            return None
+
+    # ---------- SIGNAL SCORE ----------
+
+    score = 70
+
+    if volume_ratio >= 1.5:
+        score += 10
+    else:
+        score += 5
+
+    if side == "LONG":
+
+        if market["book"] >= 1.40:
+            score += 10
+        else:
+            score += 5
+
+    else:
+
+        if market["book"] <= 0.71:
+            score += 10
+        else:
+            score += 5
+
+    # 5m використовується як
+    # додаткове підтвердження
+
+    if trends["5m"] == side:
+        score += 5
+
+    score = min(
+        score,
+        100
+    )
+
+    if score < 85:
+        logging.info(
+            "WAIT score %s",
+            score
+        )
+        return None
+
+    # ---------- STOP ----------
+
+    if side == "LONG":
+        stop = (
+            price
+            - stop_distance
+        )
+    else:
+        stop = (
+            price
+            + stop_distance
+        )
+
+    return {
+        "side": side,
+        "price": price,
+        "stop": stop,
+        "take": target,
+        "score": score,
+        "rsi": current_rsi,
+        "volume": volume_ratio,
+        "book": market["book"],
+        "funding": market["funding"],
+        "oi": market["oi"],
+        "stamp": candles15[-1]["t"]
+    }
+
+
+# ==========================================
+# TELEGRAM
+# ==========================================
+
+def telegram(message):
+
+    response = session.post(
+        (
+            "https://api.telegram.org/"
+            f"bot{TOKEN}/sendMessage"
+        ),
+        data={
+            "chat_id": CHAT,
+            "text": message
+        },
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    obj = response.json()
+
+    if not obj.get("ok"):
+        raise ValueError(
+            f"Telegram error: "
+            f"{str(obj)[:180]}"
+        )
+
+
+# ==========================================
+# FORMAT SIGNAL
+# ==========================================
+
+def format_signal(signal):
+
+    if signal["side"] == "LONG":
+        icon = "🟢"
+    else:
+        icon = "🔴"
+
+    return (
+        f"{icon} BTC V4 "
+        f"{signal['side']} (ТЕСТ)\n\n"
+
+        f"Вхід ≈ "
+        f"${signal['price']:,.2f}\n"
+
+        f"Stop Loss: "
+        f"${signal['stop']:,.2f}\n"
+
+        f"Take Profit: "
+        f"${signal['take']:,.2f}\n\n"
+
+        f"Сила сигналу: "
+        f"{signal['score']}/100\n"
+
+        f"⚠️ Це НЕ відсоток "
+        f"імовірності.\n\n"
+
+        f"RSI: "
+        f"{signal['rsi']:.1f}\n"
+
+        f"Обсяг: "
+        f"{signal['volume']:.2f}x\n"
+
+        f"Стакан bid/ask: "
+        f"{signal['book']:.2f}\n"
+
+        f"Funding: "
+        f"{signal['funding'] * 100:.4f}%\n"
+
+        f"Open Interest: "
+        f"{signal['oi']:,.2f}\n"
+
+        f"R:R = 1:2\n\n"
+
+        f"Перевір актуальну ціну "
+        f"на Binance перед входом.\n"
+
+        f"Ризик збитку залишається."
+    )
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+def main():
+
+    logging.info(
+        "BTC V4 starting - alerts only"
+    )
+
+    telegram(
+        "✅ BTC Signal Bot V4 запущений!\n\n"
+        "Джерело: Bitget Futures.\n"
+        "Таймфрейми: 5m / 15m / 1h / 4h.\n"
+        "Режим: тільки сильні сигнали.\n"
+        "Автоматичні угоди ВИМКНЕНІ."
+    )
+
+    last_signal = None
+
+    if STATE.exists():
+
+        try:
+            saved = json.loads(
+                STATE.read_text()
+            )
+                        last_signal = saved.get(
+                "id"
+            )
+
+        except Exception:
+            pass
+
+    while True:
+
+        try:
+            signal = analyze()
+
+            if signal:
+
+                signal_id = (
+                    f"{signal['side']}:"
+                    f"{signal['stamp']}"
+                )
+
+                if signal_id != last_signal:
+
+                    telegram(
+                        format_signal(
+                            signal
+                        )
+                    )
+
+                    last_signal = signal_id
+
+                    STATE.write_text(
+                        json.dumps({
+                            "id": signal_id
+                        })
+                    )
+
+                    logging.info(
+                        "Signal sent %s",
+                        signal_id
+                    )
+
+            else:
+                logging.info(
+                    "WAIT - no qualified setup"
+                )
+
+        except Exception:
+            logging.exception(
+                "Data/analysis error - NO SIGNAL"
+            )
+
+        time.sleep(
+            INTERVAL
+        )
+
+
+if __name__ == "__main__":
+    main()
