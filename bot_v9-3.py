@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BTC Signal V9.2.2 PAPER AUDIT DATA FIX — Ukrainian research bot.
+"""BTC Signal V9.2.3 PAPER AUDIT DIAGNOSTICS — Ukrainian research bot.
 No exchange credentials, no private API calls, no real orders.
 Python 3.10+ and requests. Public Bitget data and Telegram notifications only.
 Signals remain experimental; a positive PnL is never guaranteed.
@@ -26,7 +26,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-VERSION = '9.2.2-PAPER-AUDIT-DATA-FIX'
+VERSION = '9.2.3-PAPER-AUDIT-DIAG'
 API = 'https://api.bitget.com'
 TF = {'1m': 60, '5m': 300, '15m': 900, '1H': 3600, '4H': 14400, '1D': 86400}
 PAPER_REPLAY_CHUNK_MINUTES = 180
@@ -137,14 +137,24 @@ class Bitget:
         self._daily_backfill = {}
 
     def get(self, path, params):
+        """Public market data only. Preserve safe, actionable API diagnostics."""
         try:
             r = self.session.get(API + path, params=params, timeout=(5, 12))
             r.raise_for_status()
             obj = r.json()
-        except (requests.RequestException, ValueError) as e:
-            raise MarketError(f'API HTTP/JSON {path}: {type(e).__name__}') from e
+        except requests.HTTPError as e:
+            response = getattr(e, 'response', None)
+            status = getattr(response, 'status_code', '?')
+            raise MarketError(f'Bitget HTTP {status} endpoint={path}') from e
+        except requests.RequestException as e:
+            raise MarketError(f'Bitget network endpoint={path}: {type(e).__name__}') from e
+        except ValueError as e:
+            raise MarketError(f'Bitget non-JSON response endpoint={path}') from e
+        if not isinstance(obj, dict):
+            raise MarketError(f'Bitget unexpected response structure endpoint={path}')
         if obj.get('code') != '00000' or obj.get('data') is None:
-            raise MarketError(f'Bitget {path}: code={obj.get("code")}')
+            message = str(obj.get('msg') or 'no message').replace('\n', ' ')[:100]
+            raise MarketError(f'Bitget endpoint={path} code={obj.get("code")} msg={message}')
         return obj['data']
 
     @staticmethod
@@ -846,7 +856,12 @@ def once(cfg,market,db,symbol):
             if not cfg.dry_run:
                 notify(cfg,'✅ V9 PAPER: блокування через історію 1m знято. Перевірка нових входів відновлена.','paper_recovered')
     # Fail closed on any mandatory market source.
-    rows={tf:market.candles(symbol,tf) for tf in ('5m','15m','1H','4H','1D')}
+    rows={}
+    for tf in ('5m','15m','1H','4H','1D'):
+        try:
+            rows[tf] = market.candles(symbol,tf)
+        except MarketError as exc:
+            raise MarketError(f'CANDLES[{symbol}/{tf}] {exc}') from exc
     m={tf:features(rows[tf]) for tf in ('5m','15m','1H','4H','1D')}
     spot=market.book(symbol,'spot')
     fut=market.book(symbol,'futures')
@@ -960,15 +975,21 @@ def main():
                 result=once(cfg,market,db,symbol)
                 LOG.info('RESULT %s %s',symbol,result)
                 failures=0
-            except Exception:
+            except Exception as exc:
                 failures+=1
                 LOG.exception('SCAN_FAILED symbol=%s failures=%d',symbol,failures)
                 if not cfg.dry_run and failures>=3 and (not last_error_alert or time.monotonic()-last_error_alert>=3600):
+                    # Reveal the actionable reason without exposing the Telegram token.
+                    detail = f'{type(exc).__name__}: {exc}'.replace('\n', ' ')
+                    if cfg.token:
+                        detail = detail.replace(cfg.token, '[REDACTED]')
+                    detail = detail[:220]
                     notify(cfg,f'⚠️ BTC Signal V{VERSION}: {failures} помилки підряд. '
-                               'Сигнали можуть не працювати. Перевір Render Logs.','error')
+                               f'Нові сигнали можуть не працювати.\nПричина: {detail}\n'
+                               'Деталі: Render → Logs → SCAN_FAILED.', 'error')
                     last_error_alert=time.monotonic()
         if not cfg.dry_run and time.monotonic()-last_heartbeat>=cfg.heartbeat_hours*3600:
-            notify(cfg,f'💓 BTC Signal V{VERSION} працює. Останній цикл: '
+            notify(cfg,f'💓 BTC Signal V{VERSION}: процес активний (це не гарантує успішного сканування). Останній цикл: '
                        f'{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}. '
                        f'Помилки підряд: {failures}. Це не торговий сигнал.','heartbeat')
             last_heartbeat=time.monotonic()
